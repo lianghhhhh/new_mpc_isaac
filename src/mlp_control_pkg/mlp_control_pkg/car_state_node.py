@@ -70,12 +70,12 @@ class CarStateNode(Node):
                 pos_x, pos_y,
                 np.sin(car_angle), np.cos(car_angle),
                 vel_x, vel_y, ang_z,
-                np.sin(positions[fl_idx]), np.cos(positions[fl_idx]),
-                np.sin(positions[fr_idx]), np.cos(positions[fr_idx]),
-                np.sin(positions[rl_idx]), np.cos(positions[rl_idx]),
-                np.sin(positions[rr_idx]), np.cos(positions[rr_idx]),
-                velocities[fl_idx], velocities[fr_idx],
-                velocities[rl_idx], velocities[rr_idx]
+                # np.sin(positions[fl_idx]), np.cos(positions[fl_idx]),
+                # np.sin(positions[fr_idx]), np.cos(positions[fr_idx]),
+                # np.sin(positions[rl_idx]), np.cos(positions[rl_idx]),
+                # np.sin(positions[rr_idx]), np.cos(positions[rr_idx]),
+                # velocities[fl_idx], velocities[fr_idx],
+                # velocities[rl_idx], velocities[rr_idx]
             ], dtype=float)
 
             return state_19

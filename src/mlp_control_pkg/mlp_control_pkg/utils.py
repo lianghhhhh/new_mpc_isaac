@@ -15,8 +15,8 @@ def loadConfig(config_path='mlp_config.json'):
 
 class FastDynamicsModel(torch.nn.Module):
     """
-    Expects exactly the 400-element window (10 steps x 40 features).
-    Only returns the final predicted delta (19 features) to keep the graph small.
+    Expects exactly the 140-element window (10 steps x 14 features).
+    Only returns the final predicted delta (7 features) to keep the graph small.
     """
     def __init__(self, base_model, scaler_in, scaler_out):
         super().__init__()
@@ -28,7 +28,7 @@ class FastDynamicsModel(torch.nn.Module):
 
     def forward(self, nn_input):
         B = nn_input.shape[0]
-        nn_input = nn_input.view(B, 10, 40)
+        nn_input = nn_input.view(B, 10, 14)
 
         # Scale (per-feature stats broadcast across the 10 timesteps)
         x_scaled = (nn_input - self.in_mean) / self.in_scale
@@ -48,7 +48,7 @@ def loadModelFunc(model_path, dt):
     torch.set_num_interop_threads(1)
     device = 'cpu'
 
-    base_model = CarDynamicModel(input_size=400, output_size=19)
+    base_model = CarDynamicModel(input_size=140, output_size=7)
     base_model.load_state_dict(torch.load(f'{model_path}/best.pth', map_location=device))
     
     scaler_in = joblib.load(f'{model_path}/scaler_in.pkl')
@@ -60,8 +60,8 @@ def loadModelFunc(model_path, dt):
     
     l4c_model = l4c.L4CasADi(model, device=device, name='car_model')
     
-    # Input is exactly the 400 features required for the LSTM
-    nn_input_sym = ca.MX.sym('nn_input', 400) 
+    # Input is exactly the 140 features required for the LSTM
+    nn_input_sym = ca.MX.sym('nn_input', 140) 
     
     # Transpose for PyTorch mapping
     delta_sym = l4c_model(nn_input_sym.T).T
@@ -77,23 +77,24 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     # ---------------------------------------------------------
     # 1. Augmented State and Parameters
     # ---------------------------------------------------------
-    # State includes 10 past states (10 * 19 = 190) and 9 past controls (9 * 4 = 36)
-    nx = 226
-    nu = 4
+    # State includes 10 past states (10 * 7 = 70) and 9 past controls (9 * 2 = 18)
+    nx = 88
+    nu = 2
     x = ca.MX.sym('x', nx)  
     u = ca.MX.sym('u', nu)  
     
     # Parameters NOW ONLY hold the 4 target path variables (x, y, sin, cos)
-    np_p = 4
-    p = ca.MX.sym('p', np_p) 
+    np_p = 5
+    p = ca.MX.sym('p', np_p)
     target_path = p[0:4]
+    v_ref = p[4]
 
     # Extract rolling history from the augmented state vector
-    X_elements = [x[i*19 : (i+1)*19] for i in range(10)]
-    U_elements = [x[190 + i*4 : 190 + (i+1)*4] for i in range(9)]
+    X_elements = [x[i*7 : (i+1)*7] for i in range(10)]
+    U_elements = [x[70 + i*2 : 70 + (i+1)*2] for i in range(9)]
 
     # ---------------------------------------------------------
-    # 2. Build the 400 feature vector INSIDE CasADi
+    # 2. Build the 140 feature vector INSIDE CasADi
     # ---------------------------------------------------------
     # Append the CURRENT optimization control `u` to complete the 10-step control sequence
     U_full = U_elements + [u]
@@ -107,12 +108,12 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
         # 17 dim abs state (strip x,y)
         abs_state = state_i[2:] 
         
-        # 19 dim delta state
-        delta_state = ca.MX.zeros(19, 1) if i == 0 else X_full[i] - X_full[i-1]
+        # 7 dim delta state
+        delta_state = ca.MX.zeros(7, 1) if i == 0 else X_full[i] - X_full[i-1]
         
         nn_inputs.append(ca.vertcat(ctrl, abs_state, delta_state))
 
-    flat_nn_input = ca.vertcat(*nn_inputs) # 400x1
+    flat_nn_input = ca.vertcat(*nn_inputs) # 140x1
     
     # Run the neural network
     delta_pred = nn_model_func(flat_nn_input)
@@ -124,8 +125,8 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     next_physical_state = current_physical_state + delta_pred
     
     # Renormalize geometric limits securely
-    ns_list = [next_physical_state[j] for j in range(19)]
-    pairs = [(2,3), (7,8), (9,10), (11,12), (13,14)]
+    ns_list = [next_physical_state[j] for j in range(7)]
+    pairs = [(2,3)]
     for s_idx, c_idx in pairs:
         norm = ca.sqrt(next_physical_state[s_idx]**2 + next_physical_state[c_idx]**2 + 1e-8)
         ns_list[s_idx] = next_physical_state[s_idx] / norm
@@ -134,8 +135,8 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     x_next_new = ca.vertcat(*ns_list)
 
     # SHIFT THE WINDOW: Drop the oldest state/control, append the new ones
-    X_next_aug = ca.vertcat(x[19:190], x_next_new)
-    U_next_aug = ca.vertcat(x[194:226], u)
+    X_next_aug = ca.vertcat(x[7:70], x_next_new)
+    U_next_aug = ca.vertcat(x[72:88], u)
     
     # Final augmented next state
     x_next = ca.vertcat(X_next_aug, U_next_aug)
@@ -152,13 +153,17 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ocp.solver_options.N_horizon = N
     ocp.solver_options.tf = N * dt
 
-    current_x_phys = x[171:190] # The current physical state
+    current_x_phys = x[63:70] # The current physical state
 
     # Most recent historical control (the control applied on the previous
     # cycle, stored in the state history) -- used to penalize abrupt
     # reversals between consecutive control commands.
-    prev_u_hist = x[222:226]
+    prev_u_hist = x[86:88]
     delta_u = u - prev_u_hist
+
+    vel_x, vel_y = current_x_phys[4], current_x_phys[5]
+    speed = ca.sqrt(vel_x**2 + vel_y**2 + 1e-6)
+    speed_error = speed - v_ref
 
     # Residuals: What we want to drive to zero
     state_error = ca.vertcat(
@@ -173,16 +178,16 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ocp.cost.cost_type_e = 'NONLINEAR_LS'
 
     # y_expr is the vector of residuals:
-    # [error_x, error_y, error_sin, error_cos, u_fl, u_fr, u_rl, u_rr, du_fl, du_fr, du_rl, du_rr]
-    ocp.model.cost_y_expr_0 = ca.vertcat(state_error, u, delta_u)
-    ocp.model.cost_y_expr = ca.vertcat(state_error, u, delta_u)
+    # [error_x, error_y, error_sin, error_cos, speed_error, u_fl, u_fr, u_rl, u_rr, du_fl, du_fr, du_rl, du_rr]
+    ocp.model.cost_y_expr_0 = ca.vertcat(state_error, speed_error, u, delta_u)
+    ocp.model.cost_y_expr = ca.vertcat(state_error, speed_error, u, delta_u)
     ocp.model.cost_y_expr_e = state_error
 
     # Weight matrices
     # W_DU: penalizes how much u can swing between consecutive cycles.
     # Tune this up if chattering persists, down if the car feels sluggish.
     W_DU = 0.1
-    W_stage = np.diag([130.0, 130.0, 150.0, 150.0, 0.1, 0.1, 0.1, 0.1, W_DU, W_DU, W_DU, W_DU])
+    W_stage = np.diag([130.0, 130.0, 150.0, 150.0, 20.0, 0.1, 0.1, W_DU, W_DU])
     W_terminal = np.diag([130.0, 130.0, 150.0, 150.0])
 
     ocp.cost.W_0 = W_stage
@@ -190,8 +195,8 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ocp.cost.W_e = W_terminal
 
     # References (We already subtracted the target inside cost_y_expr, so the target residual is exactly zero)
-    ocp.cost.yref_0 = np.zeros(12)
-    ocp.cost.yref = np.zeros(12)
+    ocp.cost.yref_0 = np.zeros(9)
+    ocp.cost.yref = np.zeros(9)
     ocp.cost.yref_e = np.zeros(4)
 
     # ---------------------------------------------------------
@@ -200,9 +205,9 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ocp.constraints.x0 = np.zeros(nx)
     ocp.parameter_values = np.zeros(np_p)
     
-    ocp.constraints.lbu = np.array([-5.0, -5.0, -5.0, -5.0])
-    ocp.constraints.ubu = np.array([5.0, 5.0, 5.0, 5.0])
-    ocp.constraints.idxbu = np.array([0, 1, 2, 3])
+    ocp.constraints.lbu = np.array([-5.0, -5.0])
+    ocp.constraints.ubu = np.array([5.0, 5.0])
+    ocp.constraints.idxbu = np.array([0, 1])
 
     ocp.solver_options.integrator_type = 'DISCRETE'
     ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'

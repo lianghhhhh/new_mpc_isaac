@@ -19,7 +19,7 @@ class CarControlNode(Node):
         self.model_path = model_path
         self.N_steps = N_steps
         self.dt = dt
-        self.prev_u = np.zeros((4,))
+        self.prev_u = np.zeros((2,))
         self._solving = False
         self._timer_period = 0.05  # 20 Hz
         self._cycle_count = 0
@@ -32,6 +32,54 @@ class CarControlNode(Node):
         self._model_func, self._lib_dir, self._lib_name = loadModelFunc(self.model_path, self.dt)
         self._acados_solver = createAcadosSolver(self._model_func, self._lib_dir, self._lib_name, self.N_steps, self.dt)
         self.create_timer(self._timer_period, self.find_control_command)
+
+    def _absolute_path_angles(self, nearest_points, car_angle):
+        """Convert each point's car-relative heading diff into an ABSOLUTE
+        path heading, in the same convention as the rest of the pipeline.
+        (See the long comment in _build_reference_path for why it's
+        car_angle - diff rather than car_angle + diff.)
+        """
+        return [car_angle - point.angle for point in nearest_points]
+
+    def _curvature_ahead(self, nearest_points, car_angle, min_arc_length=0.05):
+        """Estimate how sharply the path ahead curves.
+
+        Deliberately uses ALL of `nearest_points`, not just the first
+        N_steps+1 that go into the solver -- if path_points_node ever
+        publishes more points than the dynamics horizon needs, this
+        function automatically gets a longer preview than the MPC stages
+        themselves, which is the whole point (see build_reference_path).
+
+        Returns an average turn-rate along the path ahead, in rad/m.
+        ~0 for a straight road, large for a tight turn. Robust to
+        duplicate/near-duplicate points (common near the end of a
+        slow-moving path buffer) by skipping near-zero-length segments
+        instead of dividing by them.
+        """
+        if nearest_points is None or len(nearest_points) < 2:
+            return 0.0
+
+        abs_angles = self._absolute_path_angles(nearest_points, car_angle)
+
+        total_heading_change = 0.0
+        total_arc_length = 0.0
+        for i in range(1, len(nearest_points)):
+            dx = nearest_points[i].x - nearest_points[i - 1].x
+            dy = nearest_points[i].y - nearest_points[i - 1].y
+            seg_len = np.hypot(dx, dy)
+            if seg_len < 1e-6:
+                continue  # stale/duplicate point, don't let it distort the average
+
+            dtheta = abs_angles[i] - abs_angles[i - 1]
+            dtheta = np.arctan2(np.sin(dtheta), np.cos(dtheta))  # wrap to [-pi, pi]
+
+            total_heading_change += abs(dtheta)
+            total_arc_length += seg_len
+
+        if total_arc_length < min_arc_length:
+            return 0.0  # not enough distance covered to trust the estimate
+
+        return total_heading_change / total_arc_length
 
     def _build_reference_path(self, nearest_points, horizon_size, car_angle):
         # NearestPoint.angle is now the heading DIFFERENCE between the car and
@@ -50,40 +98,43 @@ class CarControlNode(Node):
         # algebra: T_path = diff + T_car = diff - S_car, so
         # S_path = -T_path = S_car - diff.
         # i.e. the target must be car_angle MINUS the diff, not plus.
-        abs_angles = [car_angle - point.angle for point in nearest_points]
+        abs_angles = self._absolute_path_angles(nearest_points, car_angle)
  
         path = np.array([
             [point.x, point.y, np.sin(abs_angle), np.cos(abs_angle)]
             for point, abs_angle in zip(nearest_points, abs_angles)
         ], dtype=float)
- 
+
         if path.shape[0] >= horizon_size:
             return path[:horizon_size]
- 
+
         if len(nearest_points) >= 2:
             step_x = nearest_points[-1].x - nearest_points[-2].x
             step_y = nearest_points[-1].y - nearest_points[-2].y
             step = np.array([step_x, step_y, 0.0, 0.0], dtype=float)
-            
+
             if np.linalg.norm([step_x, step_y]) < 1e-6:
-                # Extrapolate using the true inverted tangent (absolute heading)
                 step = np.array([
-                    np.cos(abs_angles[-1]) * 0.1, 
-                    np.sin(abs_angles[-1]) * 0.1, 
+                    np.cos(abs_angles[-1]) * 0.1,
+                    np.sin(abs_angles[-1]) * 0.1,
                     0.0, 0.0
                 ], dtype=float)
         else:
             step = np.array([
-                np.cos(abs_angles[-1]) * 0.1, 
-                np.sin(abs_angles[-1]) * 0.1, 
+                np.cos(abs_angles[-1]) * 0.1,
+                np.sin(abs_angles[-1]) * 0.1,
                 0.0, 0.0
             ], dtype=float)
- 
+
         while path.shape[0] < horizon_size:
             path = np.vstack([path, path[-1] + step])
- 
+
         self.get_logger().info(f'Built reference path: {path}')
         return path
+
+    def _speed_ref(self, curvature, v_max=1.5, k=2.0):
+        """Map curvature (rad/m) to a target speed (m/s). Tune v_max/k to taste."""
+        return v_max / (1.0 + k * curvature)
 
     def publish_control_command(self, control_input):
         self.get_logger().info(f'Publishing control command: {control_input}')
@@ -92,7 +143,8 @@ class CarControlNode(Node):
         msg.name = ['front_left_joint', 'front_right_joint', 'rear_left_joint', 'rear_right_joint']
         
         # Raw assignment: The neural network was trained on raw efforts and implicitly knows the mapping!
-        msg.effort = control_input.tolist()
+        # msg.effort = control_input.tolist()
+        msg.effort = [control_input[0], control_input[1], control_input[0], control_input[1]]
         self.effort_pub.publish(msg)
 
     def publish_predicted_path(self, predicted_path):
@@ -138,7 +190,7 @@ class CarControlNode(Node):
             for _ in range(10):
                 self.state_history.append(current_state_19)
             for _ in range(9):
-                self.control_history.append(np.zeros(4))
+                self.control_history.append(np.zeros(2))
         else:
             self.state_history.append(current_state_19)
 
@@ -146,12 +198,14 @@ class CarControlNode(Node):
         self.get_logger().info(f'nearest_points: {[ (p.x, p.y, p.angle) for p in nearest_points ]}')
 
         car_angle = np.arctan2(current_state_19[2], current_state_19[3])
+        curvature = self._curvature_ahead(nearest_points, car_angle)
+        v_ref = self._speed_ref(curvature)
         path_points = self._build_reference_path(nearest_points, self.N_steps + 1, car_angle)
         
-        # Assemble the 226-dimensional augmented state vector for x0
+        # Assemble the 106-dimensional augmented state vector for x0
         augmented_x0 = np.concatenate([
-            np.concatenate(list(self.state_history)),  # 10 * 19 = 190 states
-            np.concatenate(list(self.control_history)) # 9 * 4 = 36 controls
+            np.concatenate(list(self.state_history)),  # 10 * 7 = 70 states
+            np.concatenate(list(self.control_history)) # 9 * 2 = 18 controls
         ])
         
         self._acados_solver.set(0, "lbx", augmented_x0)
@@ -177,7 +231,7 @@ class CarControlNode(Node):
 
         # Set target path parameters across the horizon (Only 4 variables now!)
         for t in range(self.N_steps + 1):
-            self._acados_solver.set(t, "p", path_points[t, :])
+            self._acados_solver.set(t, "p", np.append(path_points[t, :], v_ref))
 
         try:
             status = self._acados_solver.solve()

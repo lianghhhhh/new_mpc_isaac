@@ -1,5 +1,5 @@
 {
-    "model_path": "/home/liangh/new_mpc_isaac/model/mlp_new",
+    "model_path": "/home/liangh/new_mpc_isaac/model/mlp_new_2",
     "N_steps": 10,
     "dt": 0.05
 }
