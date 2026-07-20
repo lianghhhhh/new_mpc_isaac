@@ -25,6 +25,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        car_control_node.report_tracking_error()
         rclpy.shutdown()
 
 if __name__ == '__main__':

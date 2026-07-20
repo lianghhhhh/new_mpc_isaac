@@ -13,6 +13,50 @@ def loadConfig(config_path='mlp_config.json'):
         config = json.load(f)
     return config
 
+
+# ---------------------------------------------------------------------------
+# Body-frame delta helpers -- must exactly match convention 'B' from the
+# training-side utils.py (state_delta_body_frame / apply_body_frame_delta
+# with BODY_FRAME_CONVENTION = 'B'), since that's what the currently
+# deployed model was trained on. If you retrain with a different
+# convention, update these two functions to match, or the model's
+# position predictions will be silently rotated into the wrong frame.
+#
+# STATE_COLS layout (7-dim physical state): [pos_x, pos_y, sin_theta,
+# cos_theta, vx, vy, wz]. Index 0/1 hold body-frame (forward, lateral)
+# deltas instead of raw world dx/dy for anything derived by these
+# functions -- everything else (sin/cos, vx, vy, wz) is a plain delta.
+# ---------------------------------------------------------------------------
+
+def compute_body_delta(state_from, state_to):
+    """CasADi-symbolic equivalent of the training-side state_delta_body_frame
+    (convention B). state_from/state_to are 7x1 MX vectors."""
+    delta = state_to - state_from
+    sin_h = state_from[2]
+    cos_h = state_from[3]
+    dx = delta[0]
+    dy = delta[1]
+    forward = sin_h * dx + cos_h * dy
+    lateral = -cos_h * dx + sin_h * dy
+    return ca.vertcat(forward, lateral, delta[2], delta[3], delta[4], delta[5], delta[6])
+
+
+def apply_body_delta(state_from, delta):
+    """CasADi-symbolic equivalent of the training-side apply_body_frame_delta
+    (convention B). Does NOT renormalize sin/cos -- caller must do that
+    afterwards, same as in training."""
+    sin_h = state_from[2]
+    cos_h = state_from[3]
+    forward = delta[0]
+    lateral = delta[1]
+    dx = sin_h * forward - cos_h * lateral
+    dy = cos_h * forward + sin_h * lateral
+    return ca.vertcat(
+        state_from[0] + dx, state_from[1] + dy,
+        state_from[2] + delta[2], state_from[3] + delta[3],
+        state_from[4] + delta[4], state_from[5] + delta[5], state_from[6] + delta[6],
+    )
+
 class FastDynamicsModel(torch.nn.Module):
     """
     Expects exactly the 140-element window (10 steps x 14 features).
@@ -105,11 +149,11 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
         ctrl = U_full[i]
         state_i = X_full[i]
         
-        # 17 dim abs state (strip x,y)
+        # 5 dim abs state (strip x,y -- matches ABS_STATE_MASK in training utils.py)
         abs_state = state_i[2:] 
         
-        # 7 dim delta state
-        delta_state = ca.MX.zeros(7, 1) if i == 0 else X_full[i] - X_full[i-1]
+        # 7 dim delta state, body-frame (forward/lateral) position channels
+        delta_state = ca.MX.zeros(7, 1) if i == 0 else compute_body_delta(X_full[i - 1], X_full[i])
         
         nn_inputs.append(ca.vertcat(ctrl, abs_state, delta_state))
 
@@ -122,7 +166,10 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     # 3. Next State Integration & Shifting
     # ---------------------------------------------------------
     current_physical_state = X_full[-1]
-    next_physical_state = current_physical_state + delta_pred
+    # delta_pred's position channels are (forward, lateral) in the body
+    # frame of current_physical_state -- rotate back to world frame before
+    # integrating, same as apply_body_frame_delta does in training/rollout.
+    next_physical_state = apply_body_delta(current_physical_state, delta_pred)
     
     # Renormalize geometric limits securely
     ns_list = [next_physical_state[j] for j in range(7)]
@@ -155,9 +202,6 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
 
     current_x_phys = x[63:70] # The current physical state
 
-    # Most recent historical control (the control applied on the previous
-    # cycle, stored in the state history) -- used to penalize abrupt
-    # reversals between consecutive control commands.
     prev_u_hist = x[86:88]
     delta_u = u - prev_u_hist
 
@@ -165,12 +209,21 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     speed = ca.sqrt(vel_x**2 + vel_y**2 + 1e-6)
     speed_error = speed - v_ref
 
-    # Residuals: What we want to drive to zero
+    tx, ty = target_path[2], target_path[3]     # sin(path heading), cos(path heading)
+    dx = current_x_phys[0] - target_path[0]
+    dy = current_x_phys[1] - target_path[1]
+
+    # CORRECTED for Convention B (Y-forward):
+    # forward = sin*dx + cos*dy
+    # lateral = -cos*dx + sin*dy
+    along_track_error = dx * tx + dy * ty        # along path direction (loose)
+    cross_track_error = -dx * ty + dy * tx       # perpendicular to path (tight)
+
     state_error = ca.vertcat(
-        current_x_phys[0] - target_path[0], 
-        current_x_phys[1] - target_path[1], 
-        current_x_phys[2] - target_path[2], 
-        current_x_phys[3] - target_path[3]
+        cross_track_error,
+        along_track_error,
+        current_x_phys[2] - target_path[2],
+        current_x_phys[3] - target_path[3],
     )
 
     ocp.cost.cost_type_0 = 'NONLINEAR_LS'
@@ -184,11 +237,15 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ocp.model.cost_y_expr_e = state_error
 
     # Weight matrices
-    # W_DU: penalizes how much u can swing between consecutive cycles.
-    # Tune this up if chattering persists, down if the car feels sluggish.
+    # W_DU: Just a small touch of smoothing to prevent twitching, not a parking brake.
     W_DU = 0.1
-    W_stage = np.diag([130.0, 130.0, 150.0, 150.0, 20.0, 0.1, 0.1, W_DU, W_DU])
-    W_terminal = np.diag([130.0, 130.0, 150.0, 150.0])
+    
+    # Diagonal: [cross_track, along_track, sin_theta, cos_theta, speed, u1, u2, du1, du2]
+    # Cross-track gets a slight bump (200 -> 300)
+    # Heading drops slightly (150 -> 100)
+    W_stage = np.diag([200.0, 20.0, 100.0, 100.0, 10.0, 0.1, 0.1, W_DU, W_DU])
+    
+    W_terminal = np.diag([300.0, 20.0, 100.0, 100.0])
 
     ocp.cost.W_0 = W_stage
     ocp.cost.W = W_stage

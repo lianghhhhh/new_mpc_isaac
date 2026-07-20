@@ -24,6 +24,8 @@ class CarControlNode(Node):
         self._timer_period = 0.05  # 20 Hz
         self._cycle_count = 0
 
+        self.tracking_errors = []   # list of (cross_track, along_track, heading_err)
+
         # LSTM Sequence Windows
         self.state_history = deque(maxlen=10)
         self.control_history = deque(maxlen=9)
@@ -32,6 +34,56 @@ class CarControlNode(Node):
         self._model_func, self._lib_dir, self._lib_name = loadModelFunc(self.model_path, self.dt)
         self._acados_solver = createAcadosSolver(self._model_func, self._lib_dir, self._lib_name, self.N_steps, self.dt)
         self.create_timer(self._timer_period, self.find_control_command)
+
+    def _record_tracking_error(self, current_state_19, target_point):
+        """Log this cycle's tracking error, in the same path-frame decomposition
+        used by the cost function, so it matches what the MPC is optimizing."""
+        x_t, y_t, sin_t, cos_t = target_point
+        dx = current_state_19[0] - x_t
+        dy = current_state_19[1] - y_t
+
+        # CORRECTED for Convention B (Y-forward):
+        along_track = dx * sin_t + dy * cos_t    # along path direction
+        cross_track = -dx * cos_t + dy * sin_t   # perpendicular to path
+
+        car_heading = np.arctan2(current_state_19[2], current_state_19[3])
+        path_heading = np.arctan2(sin_t, cos_t)
+        heading_err = np.arctan2(np.sin(car_heading - path_heading),
+                                np.cos(car_heading - path_heading))  # wrapped
+
+        self.tracking_errors.append((cross_track, along_track, heading_err))
+
+
+    def report_tracking_error(self):
+        """Call this once when shutting down to summarize tracking performance."""
+        if not self.tracking_errors:
+            self.get_logger().warn('No tracking error samples recorded.')
+            return
+
+        arr = np.array(self.tracking_errors)  # shape (N, 3)
+        cross, along, heading = arr[:, 0], arr[:, 1], arr[:, 2]
+
+        def stats(name, values):
+            return (f'{name}: mean={np.mean(values):+.4f}  '
+                    f'mean_abs={np.mean(np.abs(values)):.4f}  '
+                    f'rmse={np.sqrt(np.mean(values**2)):.4f}  '
+                    f'max_abs={np.max(np.abs(values)):.4f}')
+
+        self.get_logger().info('===== Tracking Error Summary =====')
+        self.get_logger().info(f'Samples: {len(self.tracking_errors)}')
+        self.get_logger().info(stats('Cross-track (m)', cross))
+        self.get_logger().info(stats('Along-track (m)', along))
+        self.get_logger().info(stats('Heading (rad)', heading))
+        self.get_logger().info('===================================')
+
+        # optional: dump raw samples for offline plotting
+        try:
+            np.savetxt('/tmp/mpc_tracking_errors.csv', arr,
+                        delimiter=',', header='cross_track,along_track,heading_err',
+                        comments='')
+            self.get_logger().info('Saved raw samples to /tmp/mpc_tracking_errors.csv')
+        except Exception as e:
+            self.get_logger().warn(f'Could not save CSV: {e}')
 
     def _absolute_path_angles(self, nearest_points, car_angle):
         """Convert each point's car-relative heading diff into an ABSOLUTE
@@ -201,6 +253,7 @@ class CarControlNode(Node):
         curvature = self._curvature_ahead(nearest_points, car_angle)
         v_ref = self._speed_ref(curvature)
         path_points = self._build_reference_path(nearest_points, self.N_steps + 1, car_angle)
+        self._record_tracking_error(current_state_19, path_points[0])
         
         # Assemble the 106-dimensional augmented state vector for x0
         augmented_x0 = np.concatenate([
