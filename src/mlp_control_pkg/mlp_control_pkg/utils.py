@@ -236,16 +236,38 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ocp.model.cost_y_expr = ca.vertcat(state_error, speed_error, u, delta_u)
     ocp.model.cost_y_expr_e = state_error
 
-    # Weight matrices
-    # W_DU: Just a small touch of smoothing to prevent twitching, not a parking brake.
-    W_DU = 0.1
+    # 定義各個變數的「最大容許誤差 / 最大預期範圍」
+    max_cte   = 0.15  # 容許最大橫向誤差 (公尺)
+    max_ate   = 0.5   # 容許最大縱向誤差 (公尺)
+    max_head  = 0.2   # 容許最大航向誤差 (sin/cos 差值)
+    max_speed = 1.0   # 容許最大速度誤差 (m/s)
+    max_u     = 5.0   # 控制輸出的物理極限
+    max_du    = 1.0   # 容許的單步最大控制變化量
+
+    norm_factors = np.array([
+        max_cte**2, max_ate**2, max_head**2, max_head**2,
+        max_speed**2, max_u**2, max_u**2, max_du**2, max_du**2
+    ])
+
+    w_cte   = 10.0
+    w_ate   = 1.0
+    w_head  = 8.0
+    w_speed = 10.0
+    w_u     = 2.5
+    w_du    = 0.1
+
+    intuitive_weights = np.array([
+        w_cte, w_ate, w_head, w_head, w_speed, w_u, w_u, w_du, w_du
+    ])
+
+    # 最終傳給 Acados 的權重矩陣 = 直覺權重 / 正規化分母
+    final_weights = intuitive_weights / norm_factors
+    W_stage = np.diag(final_weights)
     
-    # Diagonal: [cross_track, along_track, sin_theta, cos_theta, speed, u1, u2, du1, du2]
-    # Cross-track gets a slight bump (200 -> 300)
-    # Heading drops slightly (150 -> 100)
-    W_stage = np.diag([200.0, 20.0, 100.0, 100.0, 10.0, 0.1, 0.1, W_DU, W_DU])
-    
-    W_terminal = np.diag([300.0, 20.0, 100.0, 100.0])
+    # Terminal cost
+    terminal_intuitive_weights = np.array([w_cte * 1.5, w_ate * 1.5, w_head * 1.5, w_head * 1.5])
+    final_terminal_weights = terminal_intuitive_weights / norm_factors[:4]
+    W_terminal = np.diag(final_terminal_weights)
 
     ocp.cost.W_0 = W_stage
     ocp.cost.W = W_stage
