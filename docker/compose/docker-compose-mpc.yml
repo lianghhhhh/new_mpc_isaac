@@ -1,0 +1,18 @@
+services:
+  mpc_isaac:
+    image: ${IMAGE}
+    stdin_open: true
+    tty: true
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID}
+      - FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      - MPC_CONFIG_PATH=/workspaces/config.json
+    network_mode: host
+    volumes:
+      - ../../src:/workspaces/src
+      - ../../model:/workspaces/model
+      - ../../config.json:/workspaces/config.json
+    command:
+      - bash
+      - -l
