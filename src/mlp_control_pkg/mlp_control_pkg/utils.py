@@ -8,7 +8,7 @@ from mlp_control_pkg.car_dynamic_model import CarDynamicModel
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 torch.backends.mkldnn.enabled = False
 
-def loadConfig(config_path='mlp_config.json'):
+def loadConfig(config_path='config.json'):
     with open(config_path, 'r') as f:
         config = json.load(f)
     return config

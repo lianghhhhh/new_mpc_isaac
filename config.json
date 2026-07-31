@@ -1,0 +1,5 @@
+{
+    "model_path": "/workspaces/model/mlp_new_2_body",
+    "N_steps": 10,
+    "dt": 0.05
+}
