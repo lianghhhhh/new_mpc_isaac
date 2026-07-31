@@ -250,7 +250,7 @@ def createAcadosSolver(nn_model_func, lib_dir, lib_name, N, dt):
     ])
 
     w_cte   = 10.0
-    w_ate   = 1.0
+    w_ate   = 3.0
     w_head  = 8.0
     w_speed = 10.0
     w_u     = 2.5
